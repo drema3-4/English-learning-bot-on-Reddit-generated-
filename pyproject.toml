@@ -1,0 +1,40 @@
+[project]
+name = "english-learning-bot-on-reddit"
+version = "0.1.0"
+description = "Telegram bot for learning English from Reddit posts."
+authors = [
+    { name = "Drema" },
+]
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "aiogram (>=3.0.0,<4.0.0)",
+    "sqlalchemy (>=2.0.0,<3.0.0)",
+    "aiosqlite (>=0.17.0,<0.18.0)",
+    "alembic (>=1.13.0,<2.0.0)",
+    "pydantic (>=2.0.0,<3.0.0)",
+    "pydantic-settings (>=2.0.0,<3.0.0)",
+    "openai (>=1.0.0,<2.0.0)",
+    "python-dotenv (>=1.0.0,<2.0.0)",
+    "asyncpraw (>=7.8.0,<8.0.0)",
+]
+
+[project.scripts]
+bot = "app.bot.main:main"
+migrate = "app.db.migrate:main"
+
+[tool.poetry]
+packages = [{ include = "app" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.23.0"
+ruff = "^0.6.0"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
