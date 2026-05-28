@@ -146,6 +146,77 @@ async def test_extract_words_creates_done_job_and_limits_results(
     assert jobs[0].error_message is None
 
 
+async def test_extract_words_accepts_wrapped_payload(
+    session_factory: async_sessionmaker,
+) -> None:
+    user_id, processing_job_id = await _create_processing_job(session_factory)
+    raw_response = json.dumps(
+        {
+            "words": [
+                {
+                    "lemma": "filtering",
+                    "surface_form": "filtering",
+                    "meaning_en": "removing less useful features",
+                    "meaning_ru": "фильтрация",
+                    "usage_note": "What type of filtering should I do?",
+                    "usage_note_translation": "Какую фильтрацию мне делать?",
+                }
+            ]
+        }
+    )
+    fake_llm = FakeLLM(raw_response)
+
+    result = await ExtractionService(session_factory, fake_llm).extract_words(
+        user_id,
+        processing_job_id,
+        "What type of filtering should I do for xgboost?",
+    )
+
+    assert [item.lemma for item in result] == ["filtering"]
+
+
+async def test_extract_rules_uses_matching_key_from_multi_section_payload(
+    session_factory: async_sessionmaker,
+) -> None:
+    user_id, processing_job_id = await _create_processing_job(session_factory)
+    raw_response = json.dumps(
+        {
+            "words": [
+                {
+                    "lemma": "overfit",
+                    "surface_form": "overfitting",
+                    "meaning_en": "fit training data too closely",
+                    "meaning_ru": "переобучаться",
+                    "usage_note": "High depth is leading to overfitting.",
+                    "usage_note_translation": "Большая глубина ведёт к переобучению.",
+                }
+            ],
+            "rules": [
+                {
+                    "rule_en": "Use could be to give a possible explanation.",
+                    "rule_ru": "Could be используется для возможного объяснения.",
+                    "example": "One reason could be that I am not filtering features.",
+                    "example_translation": (
+                        "Одной причиной может быть то, "
+                        "что я не фильтрую признаки."
+                    ),
+                }
+            ],
+        }
+    )
+    fake_llm = FakeLLM(raw_response)
+
+    result = await ExtractionService(session_factory, fake_llm).extract_rules(
+        user_id,
+        processing_job_id,
+        "One reason could be that I am not doing any filtering.",
+    )
+
+    assert [item.rule_en for item in result] == [
+        "Use could be to give a possible explanation."
+    ]
+
+
 async def test_extract_rules_marks_failed_job_on_bad_json(
     session_factory: async_sessionmaker,
 ) -> None:

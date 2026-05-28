@@ -99,6 +99,31 @@ async def test_process_next_job_marks_failed_on_ingestion_error(
     assert "Причина:\nboom" in bot.messages[0][1]
 
 
+async def test_process_next_job_sends_generic_source_failure_message(
+    session_factory: async_sessionmaker,
+) -> None:
+    first_job_id, _ = await _create_two_queued_jobs(session_factory)
+    ingestion_service = FakeIngestionService(RuntimeError("Could not parse a JSON array"))
+    bot = FakeBot()
+
+    processed = await process_next_job(
+        _settings(),
+        session_factory,
+        bot=bot,
+        ingestion_service=ingestion_service,
+    )
+
+    async with session_factory() as session:
+        job = await session.get(ProcessingJob, first_job_id)
+
+    assert processed is True
+    assert job is not None
+    assert job.status == "failed"
+    assert job.error_message == "Could not parse a JSON array"
+    assert "Не удалось обработать материал." in bot.messages[0][1]
+    assert "LLM вернула ответ не в ожидаемом JSON-формате." in bot.messages[0][1]
+
+
 async def test_mark_timed_out_jobs_marks_stale_processing_jobs(
     session_factory: async_sessionmaker,
 ) -> None:

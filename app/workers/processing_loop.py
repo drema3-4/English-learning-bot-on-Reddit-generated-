@@ -29,7 +29,7 @@ SUCCESS_MESSAGE = """Обработка завершена.
 /review_words
 /review_phrases
 /review_rules"""
-ERROR_MESSAGE_TEMPLATE = """Не удалось обработать ссылку.
+ERROR_MESSAGE_TEMPLATE = """Не удалось обработать материал.
 
 Причина:
 {error_message}"""
@@ -201,7 +201,16 @@ async def _notify_failure(bot: Bot | None, telegram_id: int, error_message: str)
     try:
         await bot.send_message(
             telegram_id,
-            ERROR_MESSAGE_TEMPLATE.format(error_message=error_message),
+            ERROR_MESSAGE_TEMPLATE.format(error_message=_public_error_message(error_message)),
         )
     except Exception:  # noqa: BLE001
         logger.exception("Could not send processing failure notification")
+
+
+def _public_error_message(error_message: str) -> str:
+    if "Could not parse a JSON" in error_message or "Empty JSON payload" in error_message:
+        return (
+            "LLM вернула ответ не в ожидаемом JSON-формате. "
+            "Попробуй отправить текст ещё раз или выбрать другую модель."
+        )
+    return error_message

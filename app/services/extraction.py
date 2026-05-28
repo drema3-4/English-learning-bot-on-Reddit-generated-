@@ -14,7 +14,7 @@ from app.db.models import LLMExtractionJob
 from app.db.session import create_session_factory
 from app.services.llm import LLMClient
 from app.services.reddit import RedditPost, format_reddit_text
-from app.utils.json_parse import parse_json_array
+from app.utils.json_parse import JSONParseError, parse_json_array, parse_json_object
 
 
 MAX_WORDS = 30
@@ -224,7 +224,7 @@ class ExtractionService:
         raw_response: str | None = None
         try:
             raw_response = await self._llm_client.complete_json(prompt)
-            parsed = parse_json_array(raw_response)[:limit]
+            parsed = _parse_extraction_items(raw_response, job_type)[:limit]
             items = [model_type.model_validate(item) for item in parsed]
         except Exception as exc:  # noqa: BLE001
             await self._mark_job_failed(llm_job_id, raw_response, str(exc))
@@ -453,6 +453,41 @@ def _dedupe_learning_items(items: Iterable[LearningItemData]) -> list[LearningIt
         seen.add(key)
         deduped.append(item)
     return deduped
+
+
+def _parse_extraction_items(raw_response: str, job_type: str) -> list[dict[str, Any]]:
+    try:
+        return parse_json_array(raw_response)
+    except JSONParseError as array_error:
+        try:
+            payload = parse_json_object(raw_response)
+        except JSONParseError:
+            raise array_error from None
+
+    for key in _payload_keys(job_type):
+        raw_items = payload.get(key)
+        if _is_json_object_list(raw_items):
+            return raw_items
+
+    list_values = [value for value in payload.values() if _is_json_object_list(value)]
+    if len(list_values) == 1:
+        return list_values[0]
+
+    raise JSONParseError(f"Could not find a JSON array for {job_type}")
+
+
+def _payload_keys(job_type: str) -> tuple[str, ...]:
+    if job_type == "words":
+        return ("words", "vocabulary", "items")
+    if job_type == "phrases":
+        return ("phrases", "items")
+    if job_type == "rules":
+        return ("rules", "grammar_rules", "items")
+    return ("items", job_type)
+
+
+def _is_json_object_list(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(item, dict) for item in value)
 
 
 def _clean(value: object) -> str | None:
