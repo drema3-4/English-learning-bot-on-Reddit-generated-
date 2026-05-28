@@ -464,30 +464,124 @@ def _parse_extraction_items(raw_response: str, job_type: str) -> list[dict[str, 
         except JSONParseError:
             raise array_error from None
 
-    for key in _payload_keys(job_type):
-        raw_items = payload.get(key)
-        if _is_json_object_list(raw_items):
-            return raw_items
+    if _looks_like_extraction_item(payload, job_type):
+        return [payload]
 
-    list_values = [value for value in payload.values() if _is_json_object_list(value)]
+    keyed_items = _find_items_by_key(payload, _payload_keys(job_type))
+    if keyed_items:
+        return keyed_items
+
+    list_values = _collect_json_object_lists(payload)
     if len(list_values) == 1:
         return list_values[0]
 
     raise JSONParseError(f"Could not find a JSON array for {job_type}")
 
 
-def _payload_keys(job_type: str) -> tuple[str, ...]:
+def _payload_keys(job_type: str) -> set[str]:
     if job_type == "words":
-        return ("words", "vocabulary", "items")
+        return _normalize_payload_keys(
+            "words",
+            "vocabulary",
+            "vocab",
+            "terms",
+            "important_words",
+            "useful_words",
+            "items",
+        )
     if job_type == "phrases":
-        return ("phrases", "items")
+        return _normalize_payload_keys(
+            "phrases",
+            "useful_phrases",
+            "phrase_constructions",
+            "constructions",
+            "expressions",
+            "stable_expressions",
+            "discourse_markers",
+            "items",
+        )
     if job_type == "rules":
-        return ("rules", "grammar_rules", "items")
-    return ("items", job_type)
+        return _normalize_payload_keys(
+            "rules",
+            "grammar_rules",
+            "usage_rules",
+            "grammar",
+            "patterns",
+            "usage_patterns",
+            "items",
+        )
+    return _normalize_payload_keys("items", job_type)
 
 
 def _is_json_object_list(value: object) -> bool:
     return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+
+
+def _find_items_by_key(value: object, keys: set[str]) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        for raw_key, raw_value in value.items():
+            if _normalize_payload_key(raw_key) in keys:
+                items = _flatten_json_object_lists(raw_value)
+                if items:
+                    return items
+
+        for raw_value in value.values():
+            items = _find_items_by_key(raw_value, keys)
+            if items:
+                return items
+
+    if isinstance(value, list):
+        for item in value:
+            items = _find_items_by_key(item, keys)
+            if items:
+                return items
+
+    return []
+
+
+def _flatten_json_object_lists(value: object) -> list[dict[str, Any]]:
+    return [
+        item
+        for item_list in _collect_json_object_lists(value)
+        for item in item_list
+    ]
+
+
+def _collect_json_object_lists(value: object) -> list[list[dict[str, Any]]]:
+    if _is_json_object_list(value):
+        return [value]
+    if isinstance(value, dict):
+        result: list[list[dict[str, Any]]] = []
+        for item in value.values():
+            result.extend(_collect_json_object_lists(item))
+        return result
+    if isinstance(value, list):
+        result: list[list[dict[str, Any]]] = []
+        for item in value:
+            result.extend(_collect_json_object_lists(item))
+        return result
+    return []
+
+
+def _looks_like_extraction_item(payload: dict[str, Any], job_type: str) -> bool:
+    keys = {_normalize_payload_key(key) for key in payload}
+    if job_type == "words":
+        return bool({"lemma", "surface_form"} & keys)
+    if job_type == "phrases":
+        return bool({"phrase", "function", "meaning_en", "meaning_ru"} & keys)
+    if job_type == "rules":
+        return bool({"rule", "rule_en", "rule_ru"} & keys)
+    return False
+
+
+def _normalize_payload_keys(*keys: str) -> set[str]:
+    return {_normalize_payload_key(key) for key in keys}
+
+
+def _normalize_payload_key(key: object) -> str:
+    if not isinstance(key, str):
+        return ""
+    return "_".join(key.strip().lower().replace("-", "_").split())
 
 
 def _clean(value: object) -> str | None:

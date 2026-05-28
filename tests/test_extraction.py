@@ -217,6 +217,52 @@ async def test_extract_rules_uses_matching_key_from_multi_section_payload(
     ]
 
 
+async def test_extract_phrases_accepts_nested_categorized_payload(
+    session_factory: async_sessionmaker,
+) -> None:
+    user_id, processing_job_id = await _create_processing_job(session_factory)
+    raw_response = json.dumps(
+        {
+            "result": {
+                "phrases": {
+                    "question_frames": [
+                        {
+                            "phrase": "what type of",
+                            "function": "asks for a category or kind",
+                            "meaning_en": "asks which category is appropriate",
+                            "meaning_ru": "какой тип",
+                            "example": "What type of filtering should I do?",
+                            "example_translation": "Какой тип фильтрации мне делать?",
+                        }
+                    ],
+                    "hedging": [
+                        {
+                            "phrase": "could be that",
+                            "function": "introduces a possible explanation",
+                            "meaning_en": "shows uncertainty about a reason",
+                            "meaning_ru": "может быть, что",
+                            "example": "One reason could be that I am not filtering.",
+                            "example_translation": (
+                                "Одна причина может быть в том, "
+                                "что я не делаю фильтрацию."
+                            ),
+                        }
+                    ],
+                }
+            }
+        }
+    )
+    fake_llm = FakeLLM(raw_response)
+
+    result = await ExtractionService(session_factory, fake_llm).extract_phrases(
+        user_id,
+        processing_job_id,
+        "What type of filtering should I do?",
+    )
+
+    assert [item.phrase for item in result] == ["what type of", "could be that"]
+
+
 async def test_extract_rules_marks_failed_job_on_bad_json(
     session_factory: async_sessionmaker,
 ) -> None:
