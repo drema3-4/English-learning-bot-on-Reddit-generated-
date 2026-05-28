@@ -6,18 +6,20 @@ import contextlib
 from aiogram import Bot, Dispatcher
 
 from app.bot.handlers import router
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.db.migrate import run_migrations
 from app.db.session import create_session_factory
 from app.workers.processing_loop import processing_loop
 
 
-async def async_main() -> None:
-    settings = get_settings()
+def validate_settings(settings: Settings) -> None:
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
-    run_migrations()
+
+async def async_main(settings: Settings | None = None) -> None:
+    settings = settings or get_settings()
+    validate_settings(settings)
     session_factory = create_session_factory(settings)
 
     bot = Bot(settings.telegram_bot_token)
@@ -39,9 +41,11 @@ async def async_main() -> None:
 
 
 def main() -> None:
-    asyncio.run(async_main())
+    settings = get_settings()
+    validate_settings(settings)
+    run_migrations()
+    asyncio.run(async_main(settings))
 
 
 if __name__ == "__main__":
     main()
-

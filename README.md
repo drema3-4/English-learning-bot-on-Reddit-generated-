@@ -72,10 +72,9 @@ docker compose logs -f
 docker compose up --build
 ```
 
-Контейнер перед стартом бота выполняет миграции:
+При старте бот сам выполняет миграции перед подключением к Telegram:
 
 ```bash
-poetry run alembic upgrade head
 poetry run bot
 ```
 
