@@ -28,7 +28,7 @@ class Settings(BaseSettings):
 
     @property
     def has_reddit_credentials(self) -> bool:
-        return bool(self.reddit_client_id and self.reddit_client_secret)
+        return bool(self.reddit_client_id.strip() and self.reddit_client_secret.strip())
 
 
 @lru_cache(maxsize=1)

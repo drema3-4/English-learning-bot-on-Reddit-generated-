@@ -20,6 +20,7 @@ from app.db.models import (
 )
 from app.services.extraction import PhraseExtract, RuleExtract, WordExtract
 from app.services.ingestion import IngestionService
+from app.services.processing_jobs import MANUAL_POST_SOURCE_CODE
 
 
 class FakeRedditService:
@@ -32,13 +33,22 @@ class FakeRedditService:
         return self.text
 
 
+class FailingRedditService:
+    async def fetch_post_text(self, url: str, comments_limit: int = 20) -> str:
+        raise AssertionError("Reddit API must not be called for manual text jobs")
+
+
 class FakeExtractionService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int, int, str]] = []
+
     async def extract_words(
         self,
         user_id: int,
         processing_job_id: int,
         text: str,
     ) -> list[WordExtract]:
+        self.calls.append(("words", user_id, processing_job_id, text))
         return [
             WordExtract(
                 lemma="Notice",
@@ -56,6 +66,7 @@ class FakeExtractionService:
         processing_job_id: int,
         text: str,
     ) -> list[PhraseExtract]:
+        self.calls.append(("phrases", user_id, processing_job_id, text))
         return [
             PhraseExtract(
                 phrase="to be fair",
@@ -73,6 +84,7 @@ class FakeExtractionService:
         processing_job_id: int,
         text: str,
     ) -> list[RuleExtract]:
+        self.calls.append(("rules", user_id, processing_job_id, text))
         return [
             RuleExtract(
                 rule_en="Use would to soften opinions.",
@@ -137,6 +149,30 @@ async def test_process_job_saves_raw_text_and_adds_extracted_items(
     assert user_id == word_lemmas[0].user_id
 
 
+async def test_process_manual_text_job_uses_saved_raw_text(
+    session_factory: async_sessionmaker,
+) -> None:
+    _, job_id = await _create_manual_processing_job(session_factory)
+    extraction_service = FakeExtractionService()
+    service = IngestionService(
+        session_factory,
+        FailingRedditService(),
+        extraction_service,
+        comments_limit=20,
+    )
+
+    await service.process_job(job_id)
+
+    async with session_factory() as session:
+        job = await session.get(ProcessingJob, job_id)
+
+    assert job is not None
+    assert job.reddit_url == MANUAL_POST_SOURCE_CODE
+    assert job.raw_text == "Manual English post text"
+    assert [call[0] for call in extraction_service.calls] == ["words", "phrases", "rules"]
+    assert {call[3] for call in extraction_service.calls} == {"Manual English post text"}
+
+
 async def test_add_words_reuses_existing_lemma_surface_form_and_usage_note(
     session_factory: async_sessionmaker,
 ) -> None:
@@ -182,6 +218,23 @@ async def _create_processing_job(
         job = ProcessingJob(
             user=user,
             reddit_url="https://www.reddit.com/r/test/comments/abc123/title/",
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(user)
+        await session.refresh(job)
+        return user.user_id, job.processing_job_id
+
+
+async def _create_manual_processing_job(
+    session_factory: async_sessionmaker,
+) -> tuple[int, int]:
+    async with session_factory() as session:
+        user = User(telegram_id=100)
+        job = ProcessingJob(
+            user=user,
+            reddit_url=MANUAL_POST_SOURCE_CODE,
+            raw_text="Manual English post text",
         )
         session.add(job)
         await session.commit()

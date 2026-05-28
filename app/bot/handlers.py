@@ -7,25 +7,27 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot.keyboards import rating_keyboard
 from app.bot.messages import (
-    HELP_MESSAGE,
     INVALID_RATING,
     INVALID_REDDIT_URL,
     NO_ITEMS,
     NO_JOBS,
     PROCESSING_ALREADY_ACTIVE,
     QUEUED,
+    QUEUED_TEXT,
     RATING_SAVED,
     REVIEW_COMPLETED,
     REVIEW_NOT_FOUND,
     REVIEW_SESSION_EXPIRED,
+    SEND_POST_TEXT,
     SEND_REDDIT_LINK,
-    START_MESSAGE,
     USER_LIMIT_REACHED,
-    format_review_card,
     format_job_status,
+    format_review_card,
+    help_message,
+    start_message,
 )
 from app.config import Settings
-from app.services.processing_jobs import ProcessingJobService
+from app.services.processing_jobs import ManualPostTextError, ProcessingJobService
 from app.services.review import ReviewResult, ReviewService
 from app.services.users import UserService
 from app.utils.reddit_url import RedditUrlError
@@ -42,12 +44,12 @@ async def start(
 ) -> None:
     if await _ensure_user_id(message, settings, session_factory) is None:
         return
-    await message.answer(START_MESSAGE)
+    await message.answer(start_message(settings.has_reddit_credentials))
 
 
 @router.message(Command("help"))
-async def help_command(message: Message) -> None:
-    await message.answer(HELP_MESSAGE)
+async def help_command(message: Message, settings: Settings) -> None:
+    await message.answer(help_message(settings.has_reddit_credentials))
 
 
 @router.message(Command("status"))
@@ -102,23 +104,36 @@ async def handle_text(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    text = message.text or ""
-    if "reddit.com" not in text.lower():
-        await message.answer(SEND_REDDIT_LINK)
-        return
+    text = (message.text or "").strip()
 
     user_id = await _ensure_user_id(message, settings, session_factory)
     if user_id is None:
         return
 
     async with session_factory() as session:
-        try:
-            result = await ProcessingJobService(session).queue_reddit_url(user_id, text)
-        except RedditUrlError:
-            await message.answer(INVALID_REDDIT_URL)
+        service = ProcessingJobService(session)
+
+        if settings.has_reddit_credentials:
+            if "reddit.com" not in text.lower():
+                await message.answer(SEND_REDDIT_LINK)
+                return
+
+            try:
+                result = await service.queue_reddit_url(user_id, text)
+            except RedditUrlError:
+                await message.answer(INVALID_REDDIT_URL)
+                return
+
+            await message.answer(QUEUED if result.created else PROCESSING_ALREADY_ACTIVE)
             return
 
-    await message.answer(QUEUED if result.created else PROCESSING_ALREADY_ACTIVE)
+        try:
+            result = await service.queue_manual_text(user_id, text)
+        except ManualPostTextError:
+            await message.answer(SEND_POST_TEXT)
+            return
+
+    await message.answer(QUEUED_TEXT if result.created else PROCESSING_ALREADY_ACTIVE)
 
 
 @router.callback_query(F.data.startswith("rate:"))

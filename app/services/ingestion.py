@@ -17,7 +17,7 @@ from app.db.models import (
     WordUsageNote,
 )
 from app.services.extraction import PhraseExtract, RuleExtract, WordExtract
-from app.services.processing_jobs import ProcessingJobService
+from app.services.processing_jobs import MANUAL_POST_SOURCE_CODE, ProcessingJobService
 from app.services.users import get_or_create_user
 
 
@@ -70,11 +70,16 @@ class IngestionService:
 
     async def process_job(self, job_id: int) -> None:
         job = await self._get_job(job_id)
-        source_text = await self._reddit_service.fetch_post_text(
-            job.reddit_url,
-            comments_limit=self._comments_limit,
-        )
-        await self._save_raw_text(job_id, source_text)
+        if job.reddit_url == MANUAL_POST_SOURCE_CODE:
+            source_text = (job.raw_text or "").strip()
+            if not source_text:
+                raise ValueError("Manual post text is empty")
+        else:
+            source_text = await self._reddit_service.fetch_post_text(
+                job.reddit_url,
+                comments_limit=self._comments_limit,
+            )
+            await self._save_raw_text(job_id, source_text)
 
         words = await self._extraction_service.extract_words(
             job.user_id,
