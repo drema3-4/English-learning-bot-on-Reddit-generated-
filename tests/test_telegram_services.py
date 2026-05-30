@@ -3,19 +3,41 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.bot.handlers import handle_text
+from app.bot.handlers import handle_text, profile, profile_edit, sources, start
 from app.bot.keyboards import rating_keyboard
-from app.bot.messages import QUEUED_TEXT, SEND_REDDIT_LINK, format_review_card
+from app.bot.messages import (
+    PROFILE_EDIT_REQUEST,
+    PROFILE_GENERATING,
+    PROFILE_SAVED,
+    PROFILE_SETUP_REQUEST,
+    PROFILE_SETUP_REQUIRED,
+    QUEUED_REDDIT,
+    QUEUED_TEXT,
+    REDDIT_SOURCE_UNAVAILABLE,
+    UNKNOWN_SOURCE,
+    format_review_card,
+)
 from app.config import Settings
 from app.db import models  # noqa: F401
 from app.db.base import Base
-from app.db.models import ProcessingJob, ReviewSession, WordLemma, WordSurfaceForm, WordUsageNote
-from app.services.processing_jobs import MANUAL_POST_SOURCE_CODE, ProcessingJobService
+from app.db.models import (
+    ProcessingJob,
+    ReviewSession,
+    UserBotState,
+    WordLemma,
+    WordSurfaceForm,
+    WordUsageNote,
+)
+from app.services.profile_schemas import LearningProfilePayload
+from app.services.profiles import AWAITING_PROFILE_INPUT, MissingLearningProfileError, ProfileService
+from app.services.processing_jobs import ProcessingJobService
 from app.services.review import ReviewService
+from app.services.sources.types import SourceType
 from app.services.users import UserService
 
 
@@ -75,13 +97,14 @@ async def test_processing_job_service_reuses_active_job(
     async with session_factory() as session:
         user = await UserService(session).ensure_allowed(telegram_id=100, max_users=5)
         assert user is not None
+        await _create_profile(session, user.user_id)
 
         service = ProcessingJobService(session)
-        first = await service.queue_reddit_url(
+        first = await service.queue_reddit_post(
             user.user_id,
             "https://www.reddit.com/r/test/comments/abc123/title/",
         )
-        second = await service.queue_reddit_url(
+        second = await service.queue_reddit_post(
             user.user_id,
             "https://www.reddit.com/r/test/comments/def456/other/",
         )
@@ -99,14 +122,15 @@ async def test_processing_job_service_reuses_processing_job(
         assert user is not None
         job = ProcessingJob(
             user_id=user.user_id,
-            reddit_url="https://www.reddit.com/r/test/comments/abc123/title/",
+            source_type=SourceType.REDDIT_POST.value,
+            source_ref="https://www.reddit.com/r/test/comments/abc123/title/",
             status="processing",
         )
         session.add(job)
         await session.commit()
         await session.refresh(job)
 
-        result = await ProcessingJobService(session).queue_reddit_url(
+        result = await ProcessingJobService(session).queue_reddit_post(
             user.user_id,
             "https://www.reddit.com/r/test/comments/def456/other/",
         )
@@ -121,6 +145,7 @@ async def test_processing_job_service_queues_manual_text(
     async with session_factory() as session:
         user = await UserService(session).ensure_allowed(telegram_id=100, max_users=5)
         assert user is not None
+        await _create_profile(session, user.user_id)
 
         result = await ProcessingJobService(session).queue_manual_text(
             user.user_id,
@@ -128,9 +153,26 @@ async def test_processing_job_service_queues_manual_text(
         )
 
     assert result.created is True
-    assert result.job.reddit_url == MANUAL_POST_SOURCE_CODE
+    assert result.job.source_type == SourceType.MANUAL_TEXT
+    assert result.job.source_ref is None
     assert result.job.raw_text == "Manual English post text"
+    assert result.job.profile_id is not None
+    assert result.job.profile_snapshot is not None
     assert result.job.status == "queued"
+
+
+async def test_processing_job_service_requires_profile_for_new_job(
+    session_factory: async_sessionmaker,
+) -> None:
+    async with session_factory() as session:
+        user = await UserService(session).ensure_allowed(telegram_id=100, max_users=5)
+        assert user is not None
+
+        with pytest.raises(MissingLearningProfileError):
+            await ProcessingJobService(session).queue_manual_text(
+                user.user_id,
+                "Manual English post text",
+            )
 
 
 async def test_processing_job_service_reuses_active_job_for_manual_text(
@@ -139,6 +181,7 @@ async def test_processing_job_service_reuses_active_job_for_manual_text(
     async with session_factory() as session:
         user = await UserService(session).ensure_allowed(telegram_id=100, max_users=5)
         assert user is not None
+        await _create_profile(session, user.user_id)
 
         service = ProcessingJobService(session)
         first = await service.queue_manual_text(user.user_id, "Manual English post text")
@@ -156,16 +199,18 @@ async def test_processing_job_service_creates_new_job_after_done_job(
     async with session_factory() as session:
         user = await UserService(session).ensure_allowed(telegram_id=100, max_users=5)
         assert user is not None
+        await _create_profile(session, user.user_id)
         done_job = ProcessingJob(
             user_id=user.user_id,
-            reddit_url="https://www.reddit.com/r/test/comments/abc123/title/",
+            source_type=SourceType.REDDIT_POST.value,
+            source_ref="https://www.reddit.com/r/test/comments/abc123/title/",
             status="done",
         )
         session.add(done_job)
         await session.commit()
         await session.refresh(done_job)
 
-        result = await ProcessingJobService(session).queue_reddit_url(
+        result = await ProcessingJobService(session).queue_reddit_post(
             user.user_id,
             "https://www.reddit.com/r/test/comments/def456/other/",
         )
@@ -180,6 +225,7 @@ async def test_handle_text_queues_manual_text_when_reddit_credentials_missing(
 ) -> None:
     message = FakeMessage("Manual English post text")
     settings = Settings(reddit_client_id="", reddit_client_secret="", max_users=5)
+    await _create_user_with_profile(session_factory)
 
     await handle_text(message, settings, session_factory)
 
@@ -188,23 +234,217 @@ async def test_handle_text_queues_manual_text_when_reddit_credentials_missing(
 
     assert message.answers == [QUEUED_TEXT]
     assert job is not None
-    assert job.reddit_url == MANUAL_POST_SOURCE_CODE
+    assert job.source_type == SourceType.MANUAL_TEXT
+    assert job.source_ref is None
     assert job.raw_text == "Manual English post text"
+    assert job.profile_id is not None
+    assert job.profile_snapshot is not None
 
 
-async def test_handle_text_requires_reddit_link_when_credentials_exist(
+async def test_handle_text_queues_manual_text_when_reddit_credentials_exist(
     session_factory: async_sessionmaker,
 ) -> None:
     message = FakeMessage("Manual English post text")
     settings = Settings(reddit_client_id="client", reddit_client_secret="secret", max_users=5)
+    await _create_user_with_profile(session_factory)
+
+    await handle_text(message, settings, session_factory)
+
+    async with session_factory() as session:
+        job = await session.scalar(select(ProcessingJob))
+
+    assert message.answers == [QUEUED_TEXT]
+    assert job is not None
+    assert job.source_type == SourceType.MANUAL_TEXT
+    assert job.raw_text == "Manual English post text"
+    assert job.profile_id is not None
+    assert job.profile_snapshot is not None
+
+
+async def test_handle_text_queues_reddit_post_when_credentials_exist(
+    session_factory: async_sessionmaker,
+) -> None:
+    message = FakeMessage("https://www.reddit.com/r/test/comments/abc123/title/")
+    settings = Settings(reddit_client_id="client", reddit_client_secret="secret", max_users=5)
+    await _create_user_with_profile(session_factory)
+
+    await handle_text(message, settings, session_factory)
+
+    async with session_factory() as session:
+        job = await session.scalar(select(ProcessingJob))
+
+    assert message.answers == [QUEUED_REDDIT]
+    assert job is not None
+    assert job.source_type == SourceType.REDDIT_POST
+    assert job.source_ref == "https://www.reddit.com/r/test/comments/abc123/title/"
+    assert job.raw_text is None
+    assert job.profile_id is not None
+    assert job.profile_snapshot is not None
+
+
+async def test_handle_text_rejects_reddit_post_when_credentials_missing(
+    session_factory: async_sessionmaker,
+) -> None:
+    message = FakeMessage("https://www.reddit.com/r/test/comments/abc123/title/")
+    settings = Settings(reddit_client_id="", reddit_client_secret="", max_users=5)
+    await _create_user_with_profile(session_factory)
 
     await handle_text(message, settings, session_factory)
 
     async with session_factory() as session:
         jobs = (await session.scalars(select(ProcessingJob))).all()
 
-    assert message.answers == [SEND_REDDIT_LINK]
+    assert message.answers == [REDDIT_SOURCE_UNAVAILABLE]
     assert jobs == []
+
+
+async def test_handle_text_rejects_unknown_source_url(
+    session_factory: async_sessionmaker,
+) -> None:
+    message = FakeMessage("https://example.com/article")
+    settings = Settings(reddit_client_id="client", reddit_client_secret="secret", max_users=5)
+    await _create_user_with_profile(session_factory)
+
+    await handle_text(message, settings, session_factory)
+
+    async with session_factory() as session:
+        jobs = (await session.scalars(select(ProcessingJob))).all()
+
+    assert message.answers == [UNKNOWN_SOURCE]
+    assert jobs == []
+
+
+async def test_start_without_profile_requests_profile_setup(
+    session_factory: async_sessionmaker,
+) -> None:
+    message = FakeMessage("/start")
+    settings = Settings(max_users=5)
+
+    await start(message, settings, session_factory)
+
+    async with session_factory() as session:
+        state = await session.scalar(select(UserBotState))
+
+    assert message.answers == [PROFILE_SETUP_REQUEST]
+    assert state is not None
+    assert state.state == AWAITING_PROFILE_INPUT
+
+
+async def test_profile_without_profile_requests_profile_setup(
+    session_factory: async_sessionmaker,
+) -> None:
+    message = FakeMessage("/profile")
+    settings = Settings(max_users=5)
+
+    await profile(message, settings, session_factory)
+
+    async with session_factory() as session:
+        state = await session.scalar(select(UserBotState))
+
+    assert message.answers == [PROFILE_SETUP_REQUEST]
+    assert state is not None
+    assert state.state == AWAITING_PROFILE_INPUT
+
+
+async def test_profile_with_profile_shows_summary(
+    session_factory: async_sessionmaker,
+) -> None:
+    await _create_user_with_profile(session_factory)
+    message = FakeMessage("/profile")
+    settings = Settings(max_users=5)
+
+    await profile(message, settings, session_factory)
+
+    assert len(message.answers) == 1
+    assert "Твой учебный профиль" in message.answers[0]
+    assert "Уровень: B1" in message.answers[0]
+    assert "Reddit" in message.answers[0]
+
+
+async def test_profile_edit_sets_awaiting_state(
+    session_factory: async_sessionmaker,
+) -> None:
+    await _create_user_with_profile(session_factory)
+    message = FakeMessage("/profile_edit")
+    settings = Settings(max_users=5)
+
+    await profile_edit(message, settings, session_factory)
+
+    async with session_factory() as session:
+        state = await session.scalar(select(UserBotState))
+
+    assert message.answers == [PROFILE_EDIT_REQUEST]
+    assert state is not None
+    assert state.state == AWAITING_PROFILE_INPUT
+
+
+async def test_handle_text_without_profile_requests_setup_and_creates_no_job(
+    session_factory: async_sessionmaker,
+) -> None:
+    message = FakeMessage("Manual English post text")
+    settings = Settings(max_users=5)
+
+    await handle_text(message, settings, session_factory)
+
+    async with session_factory() as session:
+        jobs = (await session.scalars(select(ProcessingJob))).all()
+        state = await session.scalar(select(UserBotState))
+
+    assert message.answers == [PROFILE_SETUP_REQUIRED]
+    assert jobs == []
+    assert state is not None
+    assert state.state == AWAITING_PROFILE_INPUT
+
+
+async def test_handle_text_awaiting_profile_generates_profile(
+    session_factory: async_sessionmaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with session_factory() as session:
+        user = await UserService(session).ensure_allowed(telegram_id=100, max_users=5)
+        assert user is not None
+        await ProfileService(session).set_awaiting_profile_input(user.user_id, reason="start")
+
+    class FakeProfileGenerationService:
+        def __init__(self, session, *_: object, **__: object) -> None:
+            self.session = session
+
+        async def generate_profile(self, user_id: int, raw_user_input: str):
+            return await ProfileService(self.session).upsert_profile(
+                user_id,
+                raw_user_input,
+                _profile_payload(),
+            )
+
+    monkeypatch.setattr(
+        "app.bot.handlers.ProfileGenerationService",
+        FakeProfileGenerationService,
+    )
+    message = FakeMessage("B1. I want Reddit and ML vocabulary.")
+    settings = Settings(max_users=5)
+
+    await handle_text(message, settings, session_factory)
+
+    async with session_factory() as session:
+        jobs = (await session.scalars(select(ProcessingJob))).all()
+        state = await session.scalar(select(UserBotState))
+        profile_row = await ProfileService(session).get_active_profile(1)
+
+    assert message.answers[0] == PROFILE_GENERATING
+    assert PROFILE_SAVED in message.answers[1]
+    assert jobs == []
+    assert state is None
+    assert profile_row is not None
+
+
+async def test_sources_command_lists_configured_sources() -> None:
+    message = FakeMessage("/sources")
+    settings = Settings(reddit_client_id="", reddit_client_secret="", max_users=5)
+
+    await sources(message, settings)
+
+    assert "Текст вручную: настроено" in message.answers[0]
+    assert "Reddit: не настроено" in message.answers[0]
 
 
 async def test_review_service_records_word_rating_and_completes_session(
@@ -285,3 +525,34 @@ async def test_review_service_times_out_stale_session(
 
     assert result.status == "empty"
     assert stale_session.status == "timeout"
+
+
+async def _create_user_with_profile(session_factory: async_sessionmaker) -> int:
+    async with session_factory() as session:
+        user = await UserService(session).ensure_allowed(telegram_id=100, max_users=5)
+        assert user is not None
+        await _create_profile(session, user.user_id)
+        return user.user_id
+
+
+async def _create_profile(session, user_id: int):
+    return await ProfileService(session).upsert_profile(
+        user_id,
+        "B1. I want to read Reddit and ML discussions.",
+        _profile_payload(),
+    )
+
+
+def _profile_payload() -> LearningProfilePayload:
+    return LearningProfilePayload(
+        cefr_level="B1",
+        level_confidence="high",
+        goals_summary="Read Reddit and machine learning discussions.",
+        focus_areas=["phrasal verbs", "discussion phrases"],
+        domain_interests=["Reddit", "machine learning"],
+        preferred_item_types={"words": "high", "phrases": "high", "rules": "medium"},
+        include=["domain vocabulary"],
+        exclude=["very basic A1 words"],
+        difficulty_policy="Mostly B1-B2 practical items.",
+        extraction_guidance="Prioritize reusable discussion language.",
+    )

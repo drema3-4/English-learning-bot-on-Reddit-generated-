@@ -1,2 +1,1 @@
-"""Application package for the Reddit English learning bot."""
-
+"""Application package for the English learning bot."""

@@ -1,11 +1,12 @@
-# Reddit English Learning Bot
+# English Source Learning Bot
 
-Telegram-бот для изучения английского по постам Reddit. Бот принимает ссылку на пост, забирает текст и комментарии, отправляет их в OpenAI-совместимую модель, сохраняет найденные слова, фразы и правила в SQLite, а затем помогает повторять материал в Telegram.
+Telegram-бот для изучения английского по текстовым источникам. Бот принимает обычный английский текст или ссылку на Reddit-пост, если Reddit API настроен, отправляет итоговый текст в OpenAI-совместимую модель, сохраняет найденные слова, фразы и правила в SQLite, а затем помогает повторять материал в Telegram.
 
 ## 1. Что делает бот
 
-- Принимает ссылки на посты Reddit.
-- Извлекает заголовок, текст поста и верхние комментарии.
+- Принимает обычный английский текст.
+- Принимает ссылки на посты Reddit, если заполнены Reddit API credentials.
+- Для Reddit извлекает заголовок, текст поста и верхние комментарии.
 - Создает карточки со словами, фразами и грамматическими правилами.
 - Хранит прогресс повторения для каждого пользователя.
 - Ограничивает доступ первыми `MAX_USERS` пользователями.
@@ -14,7 +15,7 @@ Telegram-бот для изучения английского по постам
 
 - Docker и Docker Compose на сервере.
 - Telegram Bot Token.
-- Reddit API credentials.
+- Reddit API credentials, если нужна обработка Reddit-ссылок.
 - OpenAI API key или ключ совместимого API.
 
 ## 3. Настройка .env
@@ -51,7 +52,7 @@ DATABASE_URL=sqlite+aiosqlite:////data/bot.db
 2. Создайте приложение типа `script`.
 3. Скопируйте `client_id` в `REDDIT_CLIENT_ID`.
 4. Скопируйте `secret` в `REDDIT_CLIENT_SECRET`.
-5. Оставьте понятный `REDDIT_USER_AGENT`, например `reddit-english-learning-bot/0.1`.
+5. Оставьте понятный `REDDIT_USER_AGENT`, например `english-source-learning-bot/0.1`.
 
 ## 6. Запуск через Docker Compose
 
@@ -59,7 +60,7 @@ DATABASE_URL=sqlite+aiosqlite:////data/bot.db
 
 ```bash
 git clone <repo>
-cd reddit-english-bot
+cd english-source-learning-bot
 cp .env.example .env
 nano .env
 docker compose up --build -d
@@ -83,6 +84,7 @@ poetry run bot
 ```text
 /start
 /help
+/sources
 /review_words
 /review_phrases
 /review_rules

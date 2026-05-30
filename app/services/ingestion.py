@@ -17,8 +17,7 @@ from app.db.models import (
     WordUsageNote,
 )
 from app.services.extraction import PhraseExtract, RuleExtract, WordExtract
-from app.services.processing_jobs import MANUAL_POST_SOURCE_CODE, ProcessingJobService
-from app.services.users import get_or_create_user
+from app.services.sources.types import SourceType
 
 
 DEFAULT_COMMENTS_LIMIT = 20
@@ -35,6 +34,8 @@ class StructuredExtractor(Protocol):
         user_id: int,
         processing_job_id: int,
         text: str,
+        profile_id: int | None,
+        profile_snapshot: str | None,
     ) -> list[WordExtract]:
         ...
 
@@ -43,6 +44,8 @@ class StructuredExtractor(Protocol):
         user_id: int,
         processing_job_id: int,
         text: str,
+        profile_id: int | None,
+        profile_snapshot: str | None,
     ) -> list[PhraseExtract]:
         ...
 
@@ -51,6 +54,8 @@ class StructuredExtractor(Protocol):
         user_id: int,
         processing_job_id: int,
         text: str,
+        profile_id: int | None,
+        profile_snapshot: str | None,
     ) -> list[RuleExtract]:
         ...
 
@@ -70,31 +75,44 @@ class IngestionService:
 
     async def process_job(self, job_id: int) -> None:
         job = await self._get_job(job_id)
-        if job.reddit_url == MANUAL_POST_SOURCE_CODE:
+        if not job.profile_snapshot:
+            raise ValueError("Processing job has no learning profile snapshot")
+
+        if job.source_type == SourceType.MANUAL_TEXT:
             source_text = (job.raw_text or "").strip()
             if not source_text:
-                raise ValueError("Manual post text is empty")
-        else:
+                raise ValueError("Manual text is empty")
+        elif job.source_type == SourceType.REDDIT_POST:
+            if not job.source_ref:
+                raise ValueError("Reddit source_ref is empty")
             source_text = await self._reddit_service.fetch_post_text(
-                job.reddit_url,
+                job.source_ref,
                 comments_limit=self._comments_limit,
             )
             await self._save_raw_text(job_id, source_text)
+        else:
+            raise ValueError(f"Unsupported source type: {job.source_type}")
 
         words = await self._extraction_service.extract_words(
             job.user_id,
             job.processing_job_id,
             source_text,
+            profile_id=job.profile_id,
+            profile_snapshot=job.profile_snapshot,
         )
         phrases = await self._extraction_service.extract_phrases(
             job.user_id,
             job.processing_job_id,
             source_text,
+            profile_id=job.profile_id,
+            profile_snapshot=job.profile_snapshot,
         )
         rules = await self._extraction_service.extract_rules(
             job.user_id,
             job.processing_job_id,
             source_text,
+            profile_id=job.profile_id,
+            profile_snapshot=job.profile_snapshot,
         )
 
         await self.add_words(job.user_id, words)
@@ -307,19 +325,6 @@ class IngestionService:
                 raise ValueError(f"Processing job {job_id} was not found")
             job.raw_text = source_text
             await session.commit()
-
-
-async def queue_reddit_url(
-    session: AsyncSession,
-    telegram_id: int,
-    reddit_url: str,
-) -> ProcessingJob:
-    user = await get_or_create_user(session, telegram_id)
-    if user is None:
-        raise RuntimeError("Could not create user")
-
-    result = await ProcessingJobService(session).queue_reddit_url(user.user_id, reddit_url)
-    return result.job
 
 
 def _normalize(value: str) -> str:

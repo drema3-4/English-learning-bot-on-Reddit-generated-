@@ -47,7 +47,7 @@ async def processing_loop(
 
     reddit_service = RedditService(settings)
     llm_client = LLMClient(settings)
-    extraction_service = ExtractionService(session_factory, llm_client)
+    extraction_service = _build_extraction_service(settings, session_factory, llm_client)
     ingestion_service = IngestionService(
         session_factory,
         reddit_service,
@@ -85,7 +85,11 @@ async def process_next_job(
     if ingestion_service is None:
         reddit_service = reddit_service or RedditService(settings)
         if extraction_service is None:
-            extraction_service = ExtractionService(session_factory, LLMClient(settings))
+            extraction_service = _build_extraction_service(
+                settings,
+                session_factory,
+                LLMClient(settings),
+            )
         ingestion_service = IngestionService(
             session_factory,
             reddit_service,
@@ -214,3 +218,19 @@ def _public_error_message(error_message: str) -> str:
             "Попробуй отправить текст ещё раз или выбрать другую модель."
         )
     return error_message
+
+
+def _build_extraction_service(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    llm_client: LLMClient,
+) -> ExtractionService:
+    return ExtractionService(
+        session_factory,
+        llm_client,
+        max_words=settings.extraction_max_words,
+        max_phrases=settings.extraction_max_phrases,
+        max_rules=settings.extraction_max_rules,
+        chunk_max_chars=settings.extraction_chunk_max_chars,
+        chunk_overlap_chars=settings.extraction_chunk_overlap_chars,
+    )

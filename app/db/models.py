@@ -16,6 +16,15 @@ class CreatedAtMixin:
     )
 
 
+class UpdatedAtMixin:
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
 class ReviewScoreMixin:
     current_score: Mapped[int] = mapped_column(
         Integer,
@@ -60,10 +69,66 @@ class User(CreatedAtMixin, Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    learning_profile: Mapped[UserLearningProfile | None] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+    bot_state: Mapped[UserBotState | None] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+    llm_profile_jobs: Mapped[list[LLMProfileJob]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
     review_sessions: Mapped[list[ReviewSession]] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",
     )
+
+
+class UserLearningProfile(CreatedAtMixin, UpdatedAtMixin, Base):
+    __tablename__ = "user_learning_profiles"
+    __table_args__ = (
+        Index("ix_user_learning_profiles_user_id", "user_id", unique=True),
+    )
+
+    profile_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.user_id"),
+        nullable=False,
+    )
+    raw_user_input: Mapped[str] = mapped_column(Text, nullable=False)
+    cefr_level: Mapped[str] = mapped_column(String(16), nullable=False)
+    goals_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    profile_json: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_profile: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="active",
+        server_default="active",
+        nullable=False,
+    )
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+    user: Mapped[User] = relationship(back_populates="learning_profile")
+
+
+class UserBotState(CreatedAtMixin, UpdatedAtMixin, Base):
+    __tablename__ = "user_bot_states"
+    __table_args__ = (
+        Index("ix_user_bot_states_user_id", "user_id", unique=True),
+    )
+
+    state_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.user_id"),
+        nullable=False,
+    )
+    state: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[str | None] = mapped_column(Text)
+
+    user: Mapped[User] = relationship(back_populates="bot_state")
 
 
 class WordLemma(CreatedAtMixin, ReviewScoreMixin, Base):
@@ -219,6 +284,36 @@ class RuleExample(CreatedAtMixin, ReviewScoreMixin, Base):
     rule: Mapped[Rule] = relationship(back_populates="examples")
 
 
+class LLMProfileJob(CreatedAtMixin, Base):
+    __tablename__ = "llm_profile_jobs"
+
+    llm_profile_job_id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.user_id"),
+        index=True,
+        nullable=False,
+    )
+    input_text: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_text: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_response: Mapped[str | None] = mapped_column(Text)
+    parsed_response: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="created",
+        server_default="created",
+        nullable=False,
+    )
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    user: Mapped[User] = relationship(back_populates="llm_profile_jobs")
+
+
 class LLMExtractionJob(CreatedAtMixin, Base):
     __tablename__ = "llm_extraction_jobs"
 
@@ -232,6 +327,13 @@ class LLMExtractionJob(CreatedAtMixin, Base):
         ForeignKey("processing_jobs.processing_job_id"),
         index=True,
     )
+    profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("user_learning_profiles.profile_id"),
+        index=True,
+    )
+    profile_snapshot: Mapped[str | None] = mapped_column(Text)
+    chunk_index: Mapped[int | None] = mapped_column(Integer)
+    chunk_count: Mapped[int | None] = mapped_column(Integer)
     job_type: Mapped[str] = mapped_column(String(32), nullable=False)
     input_text: Mapped[str] = mapped_column(Text, nullable=False)
     prompt_text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -266,14 +368,21 @@ class ProcessingJob(CreatedAtMixin, Base):
         index=True,
         nullable=False,
     )
-    reddit_url: Mapped[str] = mapped_column(Text, nullable=False)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_ref: Mapped[str | None] = mapped_column(Text)
+    raw_text: Mapped[str | None] = mapped_column(Text)
+    source_metadata: Mapped[str | None] = mapped_column(Text)
+    profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("user_learning_profiles.profile_id"),
+        index=True,
+    )
+    profile_snapshot: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(
         String(32),
         default="queued",
         server_default="queued",
         nullable=False,
     )
-    raw_text: Mapped[str | None] = mapped_column(Text)
     error_message: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

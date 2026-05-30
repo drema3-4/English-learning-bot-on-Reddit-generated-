@@ -46,9 +46,11 @@ def upgrade() -> None:
         "processing_jobs",
         sa.Column("processing_job_id", sa.Integer(), autoincrement=True, nullable=False),
         sa.Column("user_id", sa.Integer(), nullable=False),
-        sa.Column("reddit_url", sa.Text(), nullable=False),
-        sa.Column("status", sa.String(length=32), server_default="queued", nullable=False),
+        sa.Column("source_type", sa.String(length=64), nullable=False),
+        sa.Column("source_ref", sa.Text(), nullable=True),
         sa.Column("raw_text", sa.Text(), nullable=True),
+        sa.Column("source_metadata", sa.Text(), nullable=True),
+        sa.Column("status", sa.String(length=32), server_default="queued", nullable=False),
         sa.Column("error_message", sa.Text(), nullable=True),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
@@ -56,6 +58,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["user_id"], ["users.user_id"]),
         sa.PrimaryKeyConstraint("processing_job_id"),
     )
+    op.create_index(op.f("ix_processing_jobs_source_type"), "processing_jobs", ["source_type"], unique=False)
     op.create_index(op.f("ix_processing_jobs_user_id"), "processing_jobs", ["user_id"], unique=False)
 
     op.create_table(
@@ -248,6 +251,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_review_sessions_user_id"), table_name="review_sessions")
     op.drop_table("review_sessions")
     op.drop_index(op.f("ix_processing_jobs_user_id"), table_name="processing_jobs")
+    op.drop_index(op.f("ix_processing_jobs_source_type"), table_name="processing_jobs")
     op.drop_table("processing_jobs")
     op.drop_index(op.f("ix_phrases_user_id"), table_name="phrases")
     op.drop_index(op.f("ix_phrases_phrase"), table_name="phrases")

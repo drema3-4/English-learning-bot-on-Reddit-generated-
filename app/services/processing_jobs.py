@@ -5,12 +5,13 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import ProcessingJob
+from app.db.models import ProcessingJob, UserLearningProfile
+from app.services.profiles import MissingLearningProfileError, ProfileService
+from app.services.sources.types import SourceType
 from app.utils.reddit_url import extract_reddit_post_ref
 
 
 ACTIVE_JOB_STATUSES = {"queued", "processing"}
-MANUAL_POST_SOURCE_CODE = "about:blank"
 MAX_MANUAL_POST_TEXT_CHARS = 25_000
 
 
@@ -28,49 +29,88 @@ class ProcessingJobService:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def queue_reddit_url(
+    async def queue_source(
         self,
         user_id: int,
-        reddit_url: str,
+        source_type: SourceType,
+        source_ref: str | None,
+        raw_text: str | None = None,
+        source_metadata: str | None = None,
+        profile: UserLearningProfile | None = None,
+        require_profile: bool = True,
     ) -> QueueProcessingJobResult:
         active_job = await self.get_active_job(user_id)
         if active_job is not None:
             return QueueProcessingJobResult(job=active_job, created=False)
 
-        ref = extract_reddit_post_ref(reddit_url)
+        if profile is None and require_profile:
+            profile = await ProfileService(self._session).get_active_profile(user_id)
+            if profile is None:
+                raise MissingLearningProfileError("Active learning profile is missing")
+
+        normalized_source_ref = source_ref
+        normalized_raw_text = raw_text
+        if source_type == SourceType.MANUAL_TEXT:
+            normalized_source_ref = None
+            normalized_raw_text = _normalize_manual_text(raw_text or "")
+            if not normalized_raw_text:
+                raise ManualPostTextError("Manual text is empty")
+        elif source_type == SourceType.REDDIT_POST:
+            if not source_ref:
+                raise ValueError("Reddit source_ref is empty")
+            ref = extract_reddit_post_ref(source_ref)
+            normalized_source_ref = ref.normalized_url
+            normalized_raw_text = None
+        else:
+            raise ValueError(f"Unsupported source type: {source_type}")
+
         job = ProcessingJob(
             user_id=user_id,
-            reddit_url=ref.normalized_url,
+            source_type=source_type.value,
+            source_ref=normalized_source_ref,
+            raw_text=normalized_raw_text,
+            source_metadata=source_metadata,
+            profile_id=profile.profile_id if profile is not None else None,
+            profile_snapshot=profile.profile_json if profile is not None else None,
             status="queued",
         )
         self._session.add(job)
         await self._session.commit()
         await self._session.refresh(job)
         return QueueProcessingJobResult(job=job, created=True)
+
+    async def queue_reddit_post(
+        self,
+        user_id: int,
+        reddit_url: str,
+        source_metadata: str | None = None,
+        profile: UserLearningProfile | None = None,
+        require_profile: bool = True,
+    ) -> QueueProcessingJobResult:
+        return await self.queue_source(
+            user_id=user_id,
+            source_type=SourceType.REDDIT_POST,
+            source_ref=reddit_url,
+            source_metadata=source_metadata,
+            profile=profile,
+            require_profile=require_profile,
+        )
 
     async def queue_manual_text(
         self,
         user_id: int,
-        post_text: str,
+        text: str,
+        profile: UserLearningProfile | None = None,
+        require_profile: bool = True,
     ) -> QueueProcessingJobResult:
-        active_job = await self.get_active_job(user_id)
-        if active_job is not None:
-            return QueueProcessingJobResult(job=active_job, created=False)
-
-        normalized_text = _normalize_manual_post_text(post_text)
-        if not normalized_text:
-            raise ManualPostTextError("Manual post text is empty")
-
-        job = ProcessingJob(
+        return await self.queue_source(
             user_id=user_id,
-            reddit_url=MANUAL_POST_SOURCE_CODE,
-            raw_text=normalized_text,
-            status="queued",
+            source_type=SourceType.MANUAL_TEXT,
+            source_ref=None,
+            raw_text=text,
+            profile=profile,
+            require_profile=require_profile,
         )
-        self._session.add(job)
-        await self._session.commit()
-        await self._session.refresh(job)
-        return QueueProcessingJobResult(job=job, created=True)
 
     async def get_active_job(self, user_id: int) -> ProcessingJob | None:
         return await self._session.scalar(
@@ -92,7 +132,7 @@ class ProcessingJobService:
         )
 
 
-def _normalize_manual_post_text(text: str) -> str:
+def _normalize_manual_text(text: str) -> str:
     normalized = text.strip()
     if len(normalized) > MAX_MANUAL_POST_TEXT_CHARS:
         normalized = normalized[:MAX_MANUAL_POST_TEXT_CHARS].rstrip()

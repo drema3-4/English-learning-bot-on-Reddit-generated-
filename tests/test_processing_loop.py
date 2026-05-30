@@ -9,6 +9,7 @@ from app.config import Settings
 from app.db import models  # noqa: F401
 from app.db.base import Base
 from app.db.models import ProcessingJob, User
+from app.services.sources.types import SourceType
 from app.workers.processing_loop import mark_timed_out_jobs, process_next_job
 
 
@@ -131,7 +132,8 @@ async def test_mark_timed_out_jobs_marks_stale_processing_jobs(
         user = User(telegram_id=100)
         job = ProcessingJob(
             user=user,
-            reddit_url="https://www.reddit.com/r/test/comments/abc123/title/",
+            source_type=SourceType.REDDIT_POST.value,
+            source_ref="https://www.reddit.com/r/test/comments/abc123/title/",
             status="processing",
             started_at=datetime.now(UTC) - timedelta(seconds=10),
         )
@@ -159,11 +161,13 @@ async def _create_two_queued_jobs(
         user = User(telegram_id=100)
         first_job = ProcessingJob(
             user=user,
-            reddit_url="https://www.reddit.com/r/test/comments/abc123/title/",
+            source_type=SourceType.REDDIT_POST.value,
+            source_ref="https://www.reddit.com/r/test/comments/abc123/title/",
         )
         second_job = ProcessingJob(
             user=user,
-            reddit_url="https://www.reddit.com/r/test/comments/def456/title/",
+            source_type=SourceType.REDDIT_POST.value,
+            source_ref="https://www.reddit.com/r/test/comments/def456/title/",
         )
         session.add_all([first_job, second_job])
         await session.commit()

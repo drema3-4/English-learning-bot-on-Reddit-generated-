@@ -1,7 +1,7 @@
 [project]
 name = "english-learning-bot-on-reddit"
 version = "0.1.0"
-description = "Telegram bot for learning English from Reddit posts."
+description = "Telegram bot for learning English from text sources."
 authors = [
     { name = "Drema" },
 ]

@@ -8,29 +8,50 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.bot.keyboards import rating_keyboard
 from app.bot.messages import (
     INVALID_RATING,
-    INVALID_REDDIT_URL,
     NO_ITEMS,
     NO_JOBS,
     PROCESSING_ALREADY_ACTIVE,
-    QUEUED,
+    PROFILE_CANCELLED,
+    PROFILE_EDIT_REQUEST,
+    PROFILE_GENERATING,
+    PROFILE_GENERATION_FAILED,
+    PROFILE_SAVED,
+    PROFILE_SETUP_REQUEST,
+    PROFILE_SETUP_REQUIRED,
+    QUEUED_REDDIT,
     QUEUED_TEXT,
     RATING_SAVED,
+    SEND_SOURCE_INPUT,
     REVIEW_COMPLETED,
     REVIEW_NOT_FOUND,
     REVIEW_SESSION_EXPIRED,
-    SEND_POST_TEXT,
-    SEND_REDDIT_LINK,
+    UNKNOWN_SOURCE,
     USER_LIMIT_REACHED,
     format_job_status,
+    format_profile,
     format_review_card,
+    format_sources_status,
     help_message,
     start_message,
 )
 from app.config import Settings
+from app.services.llm import LLMClient
+from app.services.profile_generation import ProfileGenerationService
 from app.services.processing_jobs import ManualPostTextError, ProcessingJobService
+from app.services.profiles import (
+    AWAITING_PROFILE_INPUT,
+    MissingLearningProfileError,
+    ProfileGenerationError,
+    ProfileService,
+)
 from app.services.review import ReviewResult, ReviewService
+from app.services.sources import (
+    SourceAvailabilityService,
+    SourceDetectionStatus,
+    SourceDetector,
+    SourceType,
+)
 from app.services.users import UserService
-from app.utils.reddit_url import RedditUrlError
 
 
 router = Router()
@@ -42,14 +63,72 @@ async def start(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    if await _ensure_user_id(message, settings, session_factory) is None:
+    user_id = await _ensure_user_id(message, settings, session_factory)
+    if user_id is None:
         return
+    async with session_factory() as session:
+        profile_service = ProfileService(session)
+        profile = await profile_service.get_active_profile(user_id)
+        if profile is None and settings.profile_required:
+            await profile_service.set_awaiting_profile_input(user_id, reason="start")
+            await message.answer(PROFILE_SETUP_REQUEST)
+            return
     await message.answer(start_message(settings.has_reddit_credentials))
 
 
 @router.message(Command("help"))
 async def help_command(message: Message, settings: Settings) -> None:
     await message.answer(help_message(settings.has_reddit_credentials))
+
+
+@router.message(Command("profile"))
+async def profile(
+    message: Message,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user_id = await _ensure_user_id(message, settings, session_factory)
+    if user_id is None:
+        return
+
+    async with session_factory() as session:
+        profile_service = ProfileService(session)
+        active_profile = await profile_service.get_active_profile(user_id)
+        if active_profile is None:
+            await profile_service.set_awaiting_profile_input(user_id, reason="profile")
+            await message.answer(PROFILE_SETUP_REQUEST)
+            return
+        await message.answer(format_profile(active_profile))
+
+
+@router.message(Command("profile_edit"))
+async def profile_edit(
+    message: Message,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user_id = await _ensure_user_id(message, settings, session_factory)
+    if user_id is None:
+        return
+
+    async with session_factory() as session:
+        await ProfileService(session).set_awaiting_profile_input(user_id, reason="edit")
+    await message.answer(PROFILE_EDIT_REQUEST)
+
+
+@router.message(Command("profile_cancel"))
+async def profile_cancel(
+    message: Message,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user_id = await _ensure_user_id(message, settings, session_factory)
+    if user_id is None:
+        return
+
+    async with session_factory() as session:
+        await ProfileService(session).clear_state(user_id)
+    await message.answer(PROFILE_CANCELLED)
 
 
 @router.message(Command("status"))
@@ -68,7 +147,13 @@ async def status(
     if job is None:
         await message.answer(NO_JOBS)
         return
-    await message.answer(format_job_status(job.status, job.error_message))
+    await message.answer(format_job_status(job.status, job.error_message, job.source_type))
+
+
+@router.message(Command("sources"))
+async def sources(message: Message, settings: Settings) -> None:
+    service = SourceAvailabilityService(settings)
+    await message.answer(format_sources_status(service.list_sources()))
 
 
 @router.message(Command("review_words", "words"))
@@ -104,36 +189,68 @@ async def handle_text(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    text = (message.text or "").strip()
-
     user_id = await _ensure_user_id(message, settings, session_factory)
     if user_id is None:
         return
 
     async with session_factory() as session:
+        profile_service = ProfileService(session)
+        profile_state = await profile_service.get_state(user_id)
+        if profile_state is not None and profile_state.state == AWAITING_PROFILE_INPUT:
+            await _handle_profile_input(message, settings, session, user_id)
+            return
+
+        active_profile = await profile_service.get_active_profile(user_id)
+        if active_profile is None and settings.profile_required:
+            await profile_service.set_awaiting_profile_input(user_id, reason="missing")
+            await message.answer(PROFILE_SETUP_REQUIRED)
+            return
+
+    detected_source = SourceDetector().detect(message.text)
+    if detected_source.status == SourceDetectionStatus.EMPTY_INPUT:
+        await message.answer(SEND_SOURCE_INPUT)
+        return
+    if detected_source.status == SourceDetectionStatus.UNKNOWN_SOURCE:
+        await message.answer(UNKNOWN_SOURCE)
+        return
+    if detected_source.source_type is None:
+        await message.answer(UNKNOWN_SOURCE)
+        return
+
+    availability_service = SourceAvailabilityService(settings)
+    source_availability = availability_service.get_source(detected_source.source_type)
+    if not source_availability.is_configured:
+        await message.answer(source_availability.unavailable_message)
+        return
+
+    async with session_factory() as session:
         service = ProcessingJobService(session)
-
-        if settings.has_reddit_credentials:
-            if "reddit.com" not in text.lower():
-                await message.answer(SEND_REDDIT_LINK)
-                return
-
-            try:
-                result = await service.queue_reddit_url(user_id, text)
-            except RedditUrlError:
-                await message.answer(INVALID_REDDIT_URL)
-                return
-
-            await message.answer(QUEUED if result.created else PROCESSING_ALREADY_ACTIVE)
-            return
-
         try:
-            result = await service.queue_manual_text(user_id, text)
+            result = await service.queue_source(
+                user_id=user_id,
+                source_type=detected_source.source_type,
+                source_ref=detected_source.source_ref,
+                raw_text=detected_source.input_text,
+                require_profile=settings.profile_required,
+            )
         except ManualPostTextError:
-            await message.answer(SEND_POST_TEXT)
+            await message.answer(SEND_SOURCE_INPUT)
+            return
+        except MissingLearningProfileError:
+            await ProfileService(session).set_awaiting_profile_input(
+                user_id,
+                reason="missing",
+            )
+            await message.answer(PROFILE_SETUP_REQUIRED)
             return
 
-    await message.answer(QUEUED_TEXT if result.created else PROCESSING_ALREADY_ACTIVE)
+    if not result.created:
+        await message.answer(PROCESSING_ALREADY_ACTIVE)
+        return
+    if detected_source.source_type == SourceType.REDDIT_POST:
+        await message.answer(QUEUED_REDDIT)
+        return
+    await message.answer(QUEUED_TEXT)
 
 
 @router.callback_query(F.data.startswith("rate:"))
@@ -188,6 +305,32 @@ async def _send_review_item(
         )
 
     await _answer_review_result(message, result)
+
+
+async def _handle_profile_input(
+    message: Message,
+    settings: Settings,
+    session: AsyncSession,
+    user_id: int,
+) -> None:
+    raw_text = (message.text or "").strip()
+    if not raw_text:
+        await message.answer(PROFILE_SETUP_REQUIRED)
+        return
+
+    await message.answer(PROFILE_GENERATING)
+    try:
+        profile = await ProfileGenerationService(
+            session,
+            LLMClient(settings),
+            max_input_chars=settings.profile_generation_max_input_chars,
+        ).generate_profile(user_id, raw_text)
+    except ProfileGenerationError:
+        await message.answer(PROFILE_GENERATION_FAILED)
+        return
+
+    await ProfileService(session).clear_state(user_id)
+    await message.answer(f"{PROFILE_SAVED}\n\n{format_profile(profile)}")
 
 
 async def _answer_review_result(message: Message, result: ReviewResult) -> None:

@@ -19,12 +19,19 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4.1-mini"
     reddit_client_id: str = ""
     reddit_client_secret: str = ""
-    reddit_user_agent: str = "reddit-english-learning-bot/0.1"
+    reddit_user_agent: str = "english-source-learning-bot/0.1"
     database_url: str = "sqlite+aiosqlite:///./data/bot.db"
     max_users: int = 5
     reddit_comments_limit: int = 20
     processing_job_timeout_seconds: int = 120
     review_session_timeout_seconds: int = 120
+    profile_required: bool = True
+    profile_generation_max_input_chars: int = 3000
+    extraction_max_words: int = 60
+    extraction_max_phrases: int = 40
+    extraction_max_rules: int = 25
+    extraction_chunk_max_chars: int = 10_000
+    extraction_chunk_overlap_chars: int = 700
 
     @property
     def has_reddit_credentials(self) -> bool:

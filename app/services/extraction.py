@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import Any, Iterable, Protocol, TypeVar
+from typing import Any, Callable, Iterable, Protocol, TypeVar
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -13,13 +14,17 @@ from app.config import get_settings
 from app.db.models import LLMExtractionJob
 from app.db.session import create_session_factory
 from app.services.llm import LLMClient
+from app.services.profile_prompts import render_profile_for_prompt
+from app.services.profile_schemas import LearningProfilePayload
 from app.services.reddit import RedditPost, format_reddit_text
 from app.utils.json_parse import JSONParseError, parse_json_array, parse_json_object
 
 
-MAX_WORDS = 30
-MAX_PHRASES = 20
-MAX_RULES = 15
+MAX_WORDS = 60
+MAX_PHRASES = 40
+MAX_RULES = 25
+EXTRACTION_CHUNK_MAX_CHARS = 10_000
+EXTRACTION_CHUNK_OVERLAP_CHARS = 700
 
 
 class WordExtract(BaseModel):
@@ -59,6 +64,7 @@ class JSONCompleter(Protocol):
 
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+PromptBuilder = Callable[[str, str, int | None, int | None], str]
 
 
 WORDS_PROMPT = """Extract useful English vocabulary from the source text.
@@ -71,6 +77,11 @@ Rules:
 - choose important terms and useful study vocabulary;
 - account for ML/DL/NLP context when it appears;
 - prefer words whose meaning depends on the context.
+- Use the user learning profile to decide what is worth extracting.
+- Extract all useful words from this source text that match the profile, up to the configured limit.
+- Prefer items that are useful for the user's level and goals.
+- Do not extract items that the profile explicitly excludes unless they are central to the source text.
+- Do not invent examples that are unrelated to the source.
 
 Each object must have exactly these keys:
 [
@@ -83,8 +94,6 @@ Each object must have exactly these keys:
     "usage_note_translation": "Russian translation of the example"
   }
 ]
-
-Source text:
 """
 
 
@@ -97,6 +106,8 @@ Look for:
 - discourse markers;
 - typical phrases from discussions;
 - useful phrases for argumentation in English.
+- Use the user learning profile to prioritize phrases, constructions, discourse markers,
+  argumentation patterns, collocations and reusable chunks.
 
 Each object must have exactly these keys:
 [
@@ -109,8 +120,6 @@ Each object must have exactly these keys:
     "example_translation": "Russian translation of the example"
   }
 ]
-
-Source text:
 """
 
 
@@ -122,6 +131,8 @@ Look for:
 - grammatical constructions;
 - ways to build phrases;
 - useful usage patterns.
+- Use the user learning profile to choose grammar and usage rules that are practical
+  for this user's level and goals.
 
 Each object must have exactly these keys:
 [
@@ -132,9 +143,167 @@ Each object must have exactly these keys:
     "example_translation": "Russian translation of the example"
   }
 ]
-
-Source text:
 """
+
+
+def build_words_prompt(
+    source_text: str,
+    profile_prompt: str,
+    chunk_index: int | None = None,
+    chunk_count: int | None = None,
+) -> str:
+    return _build_prompt(WORDS_PROMPT, source_text, profile_prompt, chunk_index, chunk_count)
+
+
+def build_phrases_prompt(
+    source_text: str,
+    profile_prompt: str,
+    chunk_index: int | None = None,
+    chunk_count: int | None = None,
+) -> str:
+    return _build_prompt(PHRASES_PROMPT, source_text, profile_prompt, chunk_index, chunk_count)
+
+
+def build_rules_prompt(
+    source_text: str,
+    profile_prompt: str,
+    chunk_index: int | None = None,
+    chunk_count: int | None = None,
+) -> str:
+    return _build_prompt(RULES_PROMPT, source_text, profile_prompt, chunk_index, chunk_count)
+
+
+def split_text_for_extraction(
+    text: str,
+    max_chars: int,
+    overlap_chars: int,
+) -> list[str]:
+    source_text = (text or "").strip()
+    if not source_text:
+        return []
+    if max_chars <= 0 or len(source_text) <= max_chars:
+        return [source_text]
+
+    pieces = [
+        part.strip()
+        for part in re.split(r"\n\s*\n|\n", source_text)
+        if part.strip()
+    ]
+    atomic_pieces: list[str] = []
+    for piece in pieces:
+        atomic_pieces.extend(_split_oversized_piece(piece, max_chars))
+
+    chunks: list[str] = []
+    current = ""
+    for piece in atomic_pieces:
+        separator = "\n\n" if current else ""
+        candidate = f"{current}{separator}{piece}" if current else piece
+        if current and len(candidate) > max_chars:
+            chunks.append(current)
+            current = piece
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    return _add_chunk_overlap(chunks, overlap_chars)
+
+
+def _build_prompt(
+    base_prompt: str,
+    source_text: str,
+    profile_prompt: str,
+    chunk_index: int | None,
+    chunk_count: int | None,
+) -> str:
+    parts = [base_prompt.strip(), profile_prompt.strip()]
+    if chunk_index is not None and chunk_count is not None and chunk_count > 1:
+        parts.append(f"Chunk: {chunk_index} of {chunk_count}.")
+    parts.extend(["Source text:", source_text.strip()])
+    return "\n\n".join(part for part in parts if part)
+
+
+def _split_oversized_piece(piece: str, max_chars: int) -> list[str]:
+    if len(piece) <= max_chars:
+        return [piece]
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", piece)
+        if sentence.strip()
+    ]
+    if len(sentences) > 1:
+        return _pack_or_split_units(sentences, max_chars)
+    return _split_by_words(piece, max_chars)
+
+
+def _pack_or_split_units(units: list[str], max_chars: int) -> list[str]:
+    result: list[str] = []
+    current = ""
+    for unit in units:
+        if len(unit) > max_chars:
+            if current:
+                result.append(current)
+                current = ""
+            result.extend(_split_by_words(unit, max_chars))
+            continue
+
+        candidate = f"{current} {unit}".strip() if current else unit
+        if current and len(candidate) > max_chars:
+            result.append(current)
+            current = unit
+        else:
+            current = candidate
+    if current:
+        result.append(current)
+    return result
+
+
+def _split_by_words(text: str, max_chars: int) -> list[str]:
+    result: list[str] = []
+    current = ""
+    for word in text.split():
+        candidate = f"{current} {word}".strip() if current else word
+        if current and len(candidate) > max_chars:
+            result.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        result.append(current)
+    return result
+
+
+def _add_chunk_overlap(chunks: list[str], overlap_chars: int) -> list[str]:
+    if overlap_chars <= 0 or len(chunks) <= 1:
+        return chunks
+
+    with_overlap = [chunks[0]]
+    for previous, current in zip(chunks, chunks[1:]):
+        overlap = _tail_for_overlap(previous, overlap_chars)
+        with_overlap.append(f"{overlap}\n\n{current}".strip() if overlap else current)
+    return with_overlap
+
+
+def _tail_for_overlap(text: str, overlap_chars: int) -> str:
+    if len(text) <= overlap_chars:
+        return text.strip()
+    tail = text[-overlap_chars:].strip()
+    first_space = tail.find(" ")
+    if first_space > 0:
+        tail = tail[first_space + 1 :].strip()
+    return tail
+
+
+def _profile_prompt_from_snapshot(profile_snapshot: str | None) -> str:
+    if not profile_snapshot:
+        return "User learning profile:\n- English level: unknown"
+    try:
+        payload = json.loads(profile_snapshot)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Learning profile snapshot is not valid JSON") from exc
+    profile = LearningProfilePayload.model_validate(payload)
+    return render_profile_for_prompt(profile)
 
 
 @dataclass(frozen=True)
@@ -158,24 +327,38 @@ class ExtractionService:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         llm_client: JSONCompleter,
+        max_words: int = MAX_WORDS,
+        max_phrases: int = MAX_PHRASES,
+        max_rules: int = MAX_RULES,
+        chunk_max_chars: int = EXTRACTION_CHUNK_MAX_CHARS,
+        chunk_overlap_chars: int = EXTRACTION_CHUNK_OVERLAP_CHARS,
     ) -> None:
         self._session_factory = session_factory
         self._llm_client = llm_client
+        self._max_words = max_words
+        self._max_phrases = max_phrases
+        self._max_rules = max_rules
+        self._chunk_max_chars = chunk_max_chars
+        self._chunk_overlap_chars = chunk_overlap_chars
 
     async def extract_words(
         self,
         user_id: int,
         processing_job_id: int,
         text: str,
+        profile_id: int | None = None,
+        profile_snapshot: str | None = None,
     ) -> list[WordExtract]:
         return await self._extract(
             user_id=user_id,
             processing_job_id=processing_job_id,
             text=text,
             job_type="words",
-            prompt=WORDS_PROMPT + text,
+            prompt_builder=build_words_prompt,
             model_type=WordExtract,
-            limit=MAX_WORDS,
+            limit=self._max_words,
+            profile_id=profile_id,
+            profile_snapshot=profile_snapshot,
         )
 
     async def extract_phrases(
@@ -183,15 +366,19 @@ class ExtractionService:
         user_id: int,
         processing_job_id: int,
         text: str,
+        profile_id: int | None = None,
+        profile_snapshot: str | None = None,
     ) -> list[PhraseExtract]:
         return await self._extract(
             user_id=user_id,
             processing_job_id=processing_job_id,
             text=text,
             job_type="phrases",
-            prompt=PHRASES_PROMPT + text,
+            prompt_builder=build_phrases_prompt,
             model_type=PhraseExtract,
-            limit=MAX_PHRASES,
+            limit=self._max_phrases,
+            profile_id=profile_id,
+            profile_snapshot=profile_snapshot,
         )
 
     async def extract_rules(
@@ -199,15 +386,19 @@ class ExtractionService:
         user_id: int,
         processing_job_id: int,
         text: str,
+        profile_id: int | None = None,
+        profile_snapshot: str | None = None,
     ) -> list[RuleExtract]:
         return await self._extract(
             user_id=user_id,
             processing_job_id=processing_job_id,
             text=text,
             job_type="rules",
-            prompt=RULES_PROMPT + text,
+            prompt_builder=build_rules_prompt,
             model_type=RuleExtract,
-            limit=MAX_RULES,
+            limit=self._max_rules,
+            profile_id=profile_id,
+            profile_snapshot=profile_snapshot,
         )
 
     async def _extract(
@@ -216,35 +407,68 @@ class ExtractionService:
         processing_job_id: int,
         text: str,
         job_type: str,
-        prompt: str,
+        prompt_builder: PromptBuilder,
         model_type: type[ModelT],
         limit: int,
+        profile_id: int | None,
+        profile_snapshot: str | None,
     ) -> list[ModelT]:
-        llm_job_id = await self._start_job(user_id, processing_job_id, job_type, text, prompt)
-        raw_response: str | None = None
-        try:
-            raw_response = await self._llm_client.complete_json(prompt)
-            parsed = _parse_extraction_items(raw_response, job_type)[:limit]
-            items = [model_type.model_validate(item) for item in parsed]
-        except Exception as exc:  # noqa: BLE001
-            await self._mark_job_failed(llm_job_id, raw_response, str(exc))
-            raise
+        profile_prompt = _profile_prompt_from_snapshot(profile_snapshot)
+        chunks = split_text_for_extraction(
+            text,
+            max_chars=self._chunk_max_chars,
+            overlap_chars=self._chunk_overlap_chars,
+        )
+        chunk_count = len(chunks)
+        collected: list[ModelT] = []
 
-        await self._mark_job_done(llm_job_id, raw_response, items)
-        return items
+        for index, chunk in enumerate(chunks, start=1):
+            prompt = prompt_builder(chunk, profile_prompt, index, chunk_count)
+            llm_job_id = await self._start_job(
+                user_id=user_id,
+                processing_job_id=processing_job_id,
+                profile_id=profile_id,
+                profile_snapshot=profile_snapshot,
+                job_type=job_type,
+                input_text=chunk,
+                prompt_text=prompt,
+                chunk_index=index,
+                chunk_count=chunk_count,
+            )
+            raw_response: str | None = None
+            try:
+                raw_response = await self._llm_client.complete_json(prompt)
+                parsed = _parse_extraction_items(raw_response, job_type)
+                items = [model_type.model_validate(item) for item in parsed]
+            except Exception as exc:  # noqa: BLE001
+                await self._mark_job_failed(llm_job_id, raw_response, str(exc))
+                raise
+
+            await self._mark_job_done(llm_job_id, raw_response, items[:limit])
+            collected.extend(items)
+
+        return _dedupe_extracted_items(collected, job_type)[:limit]
 
     async def _start_job(
         self,
         user_id: int,
         processing_job_id: int,
+        profile_id: int | None,
+        profile_snapshot: str | None,
         job_type: str,
         input_text: str,
         prompt_text: str,
+        chunk_index: int | None,
+        chunk_count: int | None,
     ) -> int:
         async with self._session_factory() as session:
             llm_job = LLMExtractionJob(
                 user_id=user_id,
                 processing_job_id=processing_job_id,
+                profile_id=profile_id,
+                profile_snapshot=profile_snapshot,
+                chunk_index=chunk_index,
+                chunk_count=chunk_count,
                 job_type=job_type,
                 input_text=input_text,
                 prompt_text=prompt_text,
@@ -355,22 +579,66 @@ def normalize_llm_payload(payload: dict[str, Any]) -> list[LearningItemData]:
     return _dedupe_learning_items(items)
 
 
-async def extract_words(user_id: int, processing_job_id: int, text: str) -> list[WordExtract]:
-    return await _get_default_service().extract_words(user_id, processing_job_id, text)
+async def extract_words(
+    user_id: int,
+    processing_job_id: int,
+    text: str,
+    profile_id: int | None = None,
+    profile_snapshot: str | None = None,
+) -> list[WordExtract]:
+    return await _get_default_service().extract_words(
+        user_id,
+        processing_job_id,
+        text,
+        profile_id=profile_id,
+        profile_snapshot=profile_snapshot,
+    )
 
 
-async def extract_phrases(user_id: int, processing_job_id: int, text: str) -> list[PhraseExtract]:
-    return await _get_default_service().extract_phrases(user_id, processing_job_id, text)
+async def extract_phrases(
+    user_id: int,
+    processing_job_id: int,
+    text: str,
+    profile_id: int | None = None,
+    profile_snapshot: str | None = None,
+) -> list[PhraseExtract]:
+    return await _get_default_service().extract_phrases(
+        user_id,
+        processing_job_id,
+        text,
+        profile_id=profile_id,
+        profile_snapshot=profile_snapshot,
+    )
 
 
-async def extract_rules(user_id: int, processing_job_id: int, text: str) -> list[RuleExtract]:
-    return await _get_default_service().extract_rules(user_id, processing_job_id, text)
+async def extract_rules(
+    user_id: int,
+    processing_job_id: int,
+    text: str,
+    profile_id: int | None = None,
+    profile_snapshot: str | None = None,
+) -> list[RuleExtract]:
+    return await _get_default_service().extract_rules(
+        user_id,
+        processing_job_id,
+        text,
+        profile_id=profile_id,
+        profile_snapshot=profile_snapshot,
+    )
 
 
 @lru_cache(maxsize=1)
 def _get_default_service() -> ExtractionService:
     settings = get_settings()
-    return ExtractionService(create_session_factory(settings), LLMClient(settings))
+    return ExtractionService(
+        create_session_factory(settings),
+        LLMClient(settings),
+        max_words=settings.extraction_max_words,
+        max_phrases=settings.extraction_max_phrases,
+        max_rules=settings.extraction_max_rules,
+        chunk_max_chars=settings.extraction_chunk_max_chars,
+        chunk_overlap_chars=settings.extraction_chunk_overlap_chars,
+    )
 
 
 def _collect_items(raw_items: object, item_type: str) -> Iterable[LearningItemData]:
@@ -453,6 +721,37 @@ def _dedupe_learning_items(items: Iterable[LearningItemData]) -> list[LearningIt
         seen.add(key)
         deduped.append(item)
     return deduped
+
+
+def _dedupe_extracted_items(items: Iterable[ModelT], job_type: str) -> list[ModelT]:
+    deduped: list[ModelT] = []
+    seen: set[tuple[str, ...]] = set()
+    for item in items:
+        key = _extracted_item_key(item, job_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _extracted_item_key(item: BaseModel, job_type: str) -> tuple[str, ...]:
+    data = item.model_dump()
+    if job_type == "words":
+        fields = ("lemma", "meaning_en", "meaning_ru", "usage_note")
+    elif job_type == "phrases":
+        fields = ("phrase", "function", "meaning_en", "meaning_ru", "example")
+    elif job_type == "rules":
+        fields = ("rule_en", "rule_ru", "example")
+    else:
+        fields = tuple(sorted(data))
+    return tuple(_normalize_key_part(data.get(field)) for field in fields)
+
+
+def _normalize_key_part(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split()).casefold()
 
 
 def _parse_extraction_items(raw_response: str, job_type: str) -> list[dict[str, Any]]:
