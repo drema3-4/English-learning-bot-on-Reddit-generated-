@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, Callable, Iterable, Protocol, TypeVar
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
@@ -439,7 +439,7 @@ class ExtractionService:
             try:
                 raw_response = await self._llm_client.complete_json(prompt)
                 parsed = _parse_extraction_items(raw_response, job_type)
-                items = [model_type.model_validate(item) for item in parsed]
+                items = _validate_extraction_items(parsed, model_type)
             except Exception as exc:  # noqa: BLE001
                 await self._mark_job_failed(llm_job_id, raw_response, str(exc))
                 raise
@@ -733,6 +733,19 @@ def _dedupe_extracted_items(items: Iterable[ModelT], job_type: str) -> list[Mode
         seen.add(key)
         deduped.append(item)
     return deduped
+
+
+def _validate_extraction_items(
+    raw_items: Iterable[dict[str, Any]],
+    model_type: type[ModelT],
+) -> list[ModelT]:
+    items: list[ModelT] = []
+    for raw_item in raw_items:
+        try:
+            items.append(model_type.model_validate(raw_item))
+        except ValidationError:
+            continue
+    return items
 
 
 def _extracted_item_key(item: BaseModel, job_type: str) -> tuple[str, ...]:

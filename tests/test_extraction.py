@@ -380,6 +380,46 @@ async def test_extract_phrases_accepts_nested_categorized_payload(
     assert [item.phrase for item in result] == ["what type of", "could be that"]
 
 
+async def test_extract_phrases_skips_incomplete_items(
+    session_factory: async_sessionmaker,
+) -> None:
+    user_id, processing_job_id = await _create_processing_job(session_factory)
+    raw_response = json.dumps(
+        [
+            {
+                "phrase": "stay on the cutting edge",
+                "function": "talks about keeping up with the newest technology",
+                "meaning_en": "to remain current with the most advanced developments",
+                "example": "You have to give up a piece of your soul to stay on the cutting edge of tech.",
+                "example_translation": "Приходится чем-то жертвовать, чтобы оставаться на переднем крае технологий.",
+            },
+            {
+                "phrase": "on one hand",
+                "function": "introduces one side of a contrast",
+                "meaning_en": "used before the first of two contrasting points",
+                "meaning_ru": "с одной стороны",
+                "example": "On one hand, I am careful with my data.",
+                "example_translation": "С одной стороны, я осторожен со своими данными.",
+            },
+        ]
+    )
+    fake_llm = FakeLLM(raw_response)
+
+    result = await ExtractionService(session_factory, fake_llm).extract_phrases(
+        user_id,
+        processing_job_id,
+        "On one hand, I am careful with data, but I want to stay on the cutting edge.",
+    )
+
+    async with session_factory() as session:
+        job = await session.scalar(select(LLMExtractionJob))
+
+    assert [item.phrase for item in result] == ["on one hand"]
+    assert job is not None
+    assert job.status == "done"
+    assert job.error_message is None
+
+
 async def test_extract_rules_marks_failed_job_on_bad_json(
     session_factory: async_sessionmaker,
 ) -> None:
