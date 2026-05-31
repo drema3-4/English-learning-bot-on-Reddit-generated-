@@ -12,8 +12,8 @@ class LLMError(RuntimeError):
     pass
 
 
-SYSTEM_PROMPT = """You extract useful English-learning material from Reddit text.
-Return only valid JSON requested by the user prompt. Do not add markdown or explanations."""
+SYSTEM_PROMPT = """You are a JSON-only assistant for an English-learning Telegram bot.
+Follow the user prompt exactly. Return only valid JSON. Do not add markdown or explanations."""
 
 
 class LLMClient:

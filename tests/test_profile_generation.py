@@ -15,13 +15,15 @@ from app.services.profiles import ProfileGenerationError, ProfileService
 
 
 class FakeLLM:
-    def __init__(self, response: str) -> None:
-        self.response = response
+    def __init__(self, response: str | list[str]) -> None:
+        self.responses = response if isinstance(response, list) else [response]
+        self.response = self.responses[0]
         self.prompts: list[str] = []
 
     async def complete_json(self, prompt: str) -> str:
         self.prompts.append(prompt)
-        return self.response
+        response_index = min(len(self.prompts) - 1, len(self.responses) - 1)
+        return self.responses[response_index]
 
 
 @pytest_asyncio.fixture
@@ -70,6 +72,42 @@ async def test_generate_profile_parses_json_inside_markdown(
         )
 
     assert profile.cefr_level == "B1"
+
+
+async def test_generate_profile_parses_single_object_array(
+    session_factory: async_sessionmaker,
+) -> None:
+    user_id = await _create_user(session_factory)
+    fake_llm = FakeLLM(json.dumps([_profile_payload()]))
+
+    async with session_factory() as session:
+        profile = await ProfileGenerationService(session, fake_llm).generate_profile(
+            user_id,
+            "B1. I want Reddit and ML vocabulary.",
+        )
+
+    assert profile.cefr_level == "B1"
+
+
+async def test_generate_profile_repairs_invalid_first_response(
+    session_factory: async_sessionmaker,
+) -> None:
+    user_id = await _create_user(session_factory)
+    fake_llm = FakeLLM(["not json", json.dumps(_profile_payload())])
+
+    async with session_factory() as session:
+        profile = await ProfileGenerationService(session, fake_llm).generate_profile(
+            user_id,
+            "B1. I want Reddit and ML vocabulary.",
+        )
+        job = await session.scalar(select(LLMProfileJob))
+
+    assert profile.cefr_level == "B1"
+    assert len(fake_llm.prompts) == 2
+    assert "Previous response:" in fake_llm.prompts[1]
+    assert job is not None
+    assert job.status == "done"
+    assert "retry response" in (job.raw_response or "")
 
 
 async def test_generate_profile_marks_job_failed_on_invalid_json(
